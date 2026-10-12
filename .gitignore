@@ -1,0 +1,8 @@
+deps/
+x64/
+*.user
+.vs/
+*.lib
+*.exp
+*.pdb
+mod/BuildingMover/*.dll
