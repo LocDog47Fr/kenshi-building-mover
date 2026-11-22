@@ -27,7 +27,8 @@ matching the game's language.
 3. Enable **BuildingMover** in the Kenshi launcher's mod list.
 4. In game, open the editor with Shift+F12 and move a building.
 
-The changes are saved with your game, and furniture stays in place after a reload.
+The changes are saved with your game, and furniture stays in place after a reload, including when
+the building is moved across a map zone border (since 1.0.1).
 
 ## Known limits
 
@@ -38,6 +39,10 @@ The changes are saved with your game, and furniture stays in place after a reloa
   if that happens.
 - Floor items are put in place when you release the mouse (about 0.3 s after the last movement),
   not during the drag.
+- Characters are never moved. NPCs working in the building walk back on their own; if they do not,
+  give them their job again.
+- In the base game, a building can turn invisible while you drag it, and stay invisible after a long
+  move. This is cosmetic and happens without the mod too: it reappears after a save and reload.
 
 ## Building from source
 

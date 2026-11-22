@@ -27,7 +27,8 @@ anglais, selon la langue du jeu.
 3. Activer **BuildingMover** dans la liste des mods du lanceur de Kenshi.
 4. En jeu, ouvrir l'éditeur avec Maj+F12 et déplacer un bâtiment.
 
-Les changements sont enregistrés avec la partie, et les meubles restent en place après un rechargement.
+Les changements sont enregistrés avec la partie, et les meubles restent en place après un rechargement,
+y compris quand le bâtiment passe d'une zone de la carte à une autre (depuis la 1.0.1).
 
 ## Limites connues
 
@@ -38,6 +39,11 @@ Les changements sont enregistrés avec la partie, et les meubles restent en plac
   aussi ; dans ce cas, figer l'intérieur.
 - Les objets au sol sont replacés quand on relâche la souris (environ 0,3 s après le dernier
   mouvement), pas pendant le glissement.
+- Les personnages ne sont jamais déplacés. Les PNJ qui travaillent dans le bâtiment y retournent à
+  pied ; sinon, leur redonner leur tâche.
+- Dans le jeu de base, un bâtiment peut devenir invisible pendant qu'on le déplace, et le rester
+  après un grand déplacement. C'est seulement visuel et cela arrive aussi sans le mod : il
+  réapparaît après une sauvegarde et un rechargement.
 
 ## Compiler depuis les sources
 
