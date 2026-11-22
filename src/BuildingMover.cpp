@@ -5,6 +5,9 @@
 //  - elements de l'agencement exterieur (enseignes, PNJ),
 //  - eclairages muraux exterieurs (reperes par leur lumiere et leur position),
 //  - objets poses au sol a l'interieur du batiment.
+// Si le batiment change de zone de la carte, les meubles sont ranges dans la
+// nouvelle zone comme le jeu le fait pour le batiment, sinon ils seraient
+// enregistres dans l'ancienne zone et perdus au rechargement.
 // Une fenetre dans l'editeur permet de figer tout cela pour retrouver le
 // comportement d'origine (le batiment bouge seul).
 // Le texte du bouton est en francais ou en anglais selon la langue du jeu.
@@ -74,6 +77,8 @@ namespace
         Ogre::Quaternion startRot;
         DWORD lastMove;
         std::vector<Building*> furniture;
+        std::vector<ZoneMap*> furnitureZones; // zone de chaque meuble au debut
+        ZoneMap* buildingZone;                // zone du batiment au debut
         std::vector<ItemStart> items;
     };
 
@@ -208,6 +213,78 @@ namespace
         DebugLog(s.str());
     }
 
+    // Zones de la carte. Le jeu enregistre chaque zone a part : un objet est
+    // sauvegarde avec la zone dont la liste (ZoneMapContent::things) le contient.
+    // Quand l'editeur fait passer un batiment dans une autre zone, le jeu le
+    // retire de la liste de l'ancienne zone, l'ajoute a celle de la nouvelle et
+    // efface son identifiant d'instance (LevelEditor::update, Kenshi 1.0.65).
+    // On fait de meme pour les meubles : un meuble laisse dans l'ancienne zone
+    // est recharge avant son batiment et le jeu l'ignore ("Parent building
+    // missing - Furniture will be skipped").
+    const size_t VTABLE_GET_ZONE_MAP_LOCATION = 0xC8 / 8; // RootObject::getZoneMapLocation
+    const size_t VTABLE_ADD_ACTIVE_OBJECT = 0x10 / 8;     // RootObjectContainer::addActiveObject
+    const size_t VTABLE_REMOVE_OBJECT = 0x18 / 8;         // RootObjectContainer::removeObject
+
+    // Zone ou le jeu range l'objet (pour un meuble : celle de son batiment).
+    ZoneMap* ZoneOf(RootObject* o)
+    {
+        typedef ZoneMap* (*Fn)(RootObject*);
+        return (*reinterpret_cast<Fn**>(o))[VTABLE_GET_ZONE_MAP_LOCATION](o);
+    }
+
+    // ZoneMap::mapContent (+0x0), un ZoneMapContent qui derive de RootObjectContainer.
+    RootObjectContainer* ContentOf(ZoneMap* zone)
+    {
+        return zone ? *reinterpret_cast<RootObjectContainer**>(zone) : NULL;
+    }
+
+    bool CallContainer(RootObjectContainer* c, size_t slot, RootObject* o)
+    {
+        typedef bool (*Fn)(RootObjectContainer*, RootObject*);
+        return (*reinterpret_cast<Fn**>(c))[slot](c, o);
+    }
+
+    bool Contains(RootObjectContainer* c, RootObject* o)
+    {
+        for (uint32_t i = 0; i < c->things.size(); ++i)
+            if (c->things.stuff[i] == o)
+                return true;
+        return false;
+    }
+
+    // Range dans la zone du batiment les meubles qui sont restes dans une autre zone.
+    void MoveFurnitureToNewZones()
+    {
+        size_t moved = 0, missing = 0;
+        for (size_t i = 0; i < g_drag.furniture.size(); ++i)
+        {
+            Building* f = g_drag.furniture[i];
+            RootObjectContainer* from = ContentOf(g_drag.furnitureZones[i]);
+            RootObjectContainer* to = ContentOf(ZoneOf(f));
+            if (!from || !to || from == to)
+                continue;
+            if (!Contains(from, f))
+            {
+                ++missing;
+                continue;
+            }
+            CallContainer(from, VTABLE_REMOVE_OBJECT, f);
+            if (!Contains(to, f))
+                CallContainer(to, VTABLE_ADD_ACTIVE_OBJECT, f);
+            f->instanceID.uid.clear();
+            f->notifyChange();
+            ++moved;
+        }
+        if (moved || missing || ZoneOf(g_drag.building) != g_drag.buildingZone)
+        {
+            std::ostringstream s;
+            s << "BuildingMover : changement de zone, " << moved << " meuble(s) range(s) dans la nouvelle zone";
+            if (missing)
+                s << ", " << missing << " absent(s) de la liste de leur ancienne zone";
+            DebugLog(s.str());
+        }
+    }
+
     // Fin du glisser : replace les objets au sol avec le deplacement total.
     void FinishDrag()
     {
@@ -232,7 +309,9 @@ namespace
             item->_NV_deactivate();
             item->_NV_activate(true, newPos, newRot, fixed, bareWeapon, dynamic);
         }
+        MoveFurnitureToNewZones();
         g_drag.furniture.clear();
+        g_drag.furnitureZones.clear();
         g_drag.items.clear();
     }
 
@@ -243,8 +322,12 @@ namespace
         g_drag.startPos = posBefore;
         g_drag.startRot = rotBefore;
         g_drag.furniture.clear();
+        g_drag.furnitureZones.clear();
         g_drag.items.clear();
         FindFurniture(b, g_drag.furniture);
+        for (size_t i = 0; i < g_drag.furniture.size(); ++i)
+            g_drag.furnitureZones.push_back(ZoneOf(g_drag.furniture[i]));
+        g_drag.buildingZone = ZoneOf(b);
         FindItems(b, g_drag.items);
     }
 
@@ -440,9 +523,10 @@ namespace
 
 __declspec(dllexport) void startPlugin()
 {
-    DebugLog("BuildingMover : chargement (phase 4, FR/EN)");
+    DebugLog("BuildingMover : chargement (1.0.1, changement de zone)");
     g_drag.active = false;
     g_drag.building = NULL;
+    g_drag.buildingZone = NULL;
 
     if (KenshiLib::SUCCESS != KenshiLib::AddHook(
             KenshiLib::GetRealAddress(&TransformWindow::updateGizmo),
