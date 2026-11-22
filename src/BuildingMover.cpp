@@ -5,9 +5,9 @@
 //  - elements de l'agencement exterieur (enseignes, PNJ),
 //  - eclairages muraux exterieurs (reperes par leur lumiere et leur position),
 //  - objets poses au sol a l'interieur du batiment.
-// Si le batiment change de zone de la carte, les meubles sont ranges dans la
-// nouvelle zone comme le jeu le fait pour le batiment, sinon ils seraient
-// enregistres dans l'ancienne zone et perdus au rechargement.
+// Si le batiment change de zone de la carte, le batiment et ses meubles sont
+// ranges dans la nouvelle zone (liste d'objets et identifiants), sinon les
+// meubles seraient perdus au rechargement.
 // Une fenetre dans l'editeur permet de figer tout cela pour retrouver le
 // comportement d'origine (le batiment bouge seul).
 // Le texte du bouton est en francais ou en anglais selon la langue du jeu.
@@ -27,6 +27,8 @@
 #include <kenshi/util/lektor.h>
 #include <kenshi/util/YesNoMaybe.h>
 #include <kenshi/PhysicsCollection.h>
+#include <kenshi/HandleManager.h>
+#include <kenshi/ZoneManager.h>
 
 #include <ogre/OgreSceneNode.h>
 
@@ -218,9 +220,19 @@ namespace
     // Quand l'editeur fait passer un batiment dans une autre zone, le jeu le
     // retire de la liste de l'ancienne zone, l'ajoute a celle de la nouvelle et
     // efface son identifiant d'instance (LevelEditor::update, Kenshi 1.0.65).
-    // On fait de meme pour les meubles : un meuble laisse dans l'ancienne zone
-    // est recharge avant son batiment et le jeu l'ignore ("Parent building
-    // missing - Furniture will be skipped").
+    // On fait de meme pour les meubles.
+    //
+    // Cela ne suffit pas : chaque zone a aussi sa liste d'identifiants
+    // (ZoneMapContent::myHandles) et un meuble retrouve son batiment au
+    // chargement grace a l'identifiant enregistre sous "isInsideBuilding"
+    // (zone + numero). Au chargement, le jeu range le batiment dans la liste de
+    // la zone ou il est enregistre et change donc la zone de son identifiant
+    // (HandleList::addExistingAndForceContainer). L'identifiant garde par les
+    // meubles designe encore l'ancienne zone, le batiment n'y est plus et le jeu
+    // ignore les meubles ("Parent building missing - Furniture will be skipped").
+    // On change donc tout de suite l'identifiant du batiment et des meubles de
+    // zone, comme le ferait le chargement, et on donne aux meubles le nouvel
+    // identifiant de leur batiment.
     const size_t VTABLE_GET_ZONE_MAP_LOCATION = 0xC8 / 8; // RootObject::getZoneMapLocation
     const size_t VTABLE_ADD_ACTIVE_OBJECT = 0x10 / 8;     // RootObjectContainer::addActiveObject
     const size_t VTABLE_REMOVE_OBJECT = 0x18 / 8;         // RootObjectContainer::removeObject
@@ -233,9 +245,32 @@ namespace
     }
 
     // ZoneMap::mapContent (+0x0), un ZoneMapContent qui derive de RootObjectContainer.
+    // (ZoneMapContent.h ne peut pas etre inclus avec les autres en-tetes.)
     RootObjectContainer* ContentOf(ZoneMap* zone)
     {
         return zone ? *reinterpret_cast<RootObjectContainer**>(zone) : NULL;
+    }
+
+    // ZoneMapContent::myHandles (+0x98) : liste d'identifiants de la zone.
+    const size_t ZONE_CONTENT_MY_HANDLES = 0x98;
+    HandleList* HandlesOf(ZoneMap* zone)
+    {
+        RootObjectContainer* c = ContentOf(zone);
+        return c ? *reinterpret_cast<HandleList**>(reinterpret_cast<char*>(c) + ZONE_CONTENT_MY_HANDLES) : NULL;
+    }
+
+    // Zone designee par l'identifiant d'un batiment ou d'un meuble.
+    ZoneMap* HandleZone(const hand& h)
+    {
+        if (!ou || !ou->zoneMgr)
+            return NULL;
+        return ou->zoneMgr->getZoneMapFromBuildingHandle(h);
+    }
+
+    bool SameHandle(const hand& a, const hand& b)
+    {
+        return a.type == b.type && a.container == b.container && a.containerSerial == b.containerSerial
+            && a.index == b.index && a.serial == b.serial;
     }
 
     bool CallContainer(RootObjectContainer* c, size_t slot, RootObject* o)
@@ -252,37 +287,112 @@ namespace
         return false;
     }
 
-    // Range dans la zone du batiment les meubles qui sont restes dans une autre zone.
+    // Range un meuble dans la liste d'objets de sa nouvelle zone.
+    // Renvoie false s'il n'est dans la liste d'aucune des zones connues.
+    bool MoveToZoneList(RootObject* o, ZoneMap* newZone, ZoneMap* handleZone, ZoneMap* startZone)
+    {
+        RootObjectContainer* to = ContentOf(newZone);
+        if (!to)
+            return true;
+        if (Contains(to, o))
+            return true;
+        RootObjectContainer* from = ContentOf(handleZone);
+        if (!from || !Contains(from, o))
+            from = ContentOf(startZone);
+        if (!from || from == to || !Contains(from, o))
+            return false;
+        CallContainer(from, VTABLE_REMOVE_OBJECT, o);
+        if (!Contains(to, o))
+            CallContainer(to, VTABLE_ADD_ACTIVE_OBJECT, o);
+        return true;
+    }
+
+    // Passe l'identifiant de o dans la liste d'identifiants de newZone.
+    bool MoveHandleToZone(RootObject* o, ZoneMap* newZone)
+    {
+        ZoneMap* oldZone = HandleZone(o->handle);
+        HandleList* to = HandlesOf(newZone);
+        if (!oldZone || !to || oldZone == newZone)
+            return false;
+        const hand oldHandle = o->handle;
+        // Le jeu met a jour o->handle (RootObjectBase::setHandle).
+        to->_NV_addExistingAndForceContainer(o, oldHandle);
+        HandleList* from = HandlesOf(oldZone);
+        if (from && oldHandle.index < from->maxSize && from->objects[oldHandle.index] == o)
+            from->_NV_destroy(oldHandle);
+        return true;
+    }
+
     void MoveFurnitureToNewZones()
     {
-        size_t moved = 0, missing = 0;
-        for (size_t i = 0; i < g_drag.furniture.size(); ++i)
+        Building* b = g_drag.building;
+        ZoneMap* buildingZone = ZoneOf(b);
+        ZoneMap* oldBuildingZone = HandleZone(b->handle);
+        const size_t count = g_drag.furniture.size();
+
+        // Zones calculees avant tout changement d'identifiant (un meuble trouve
+        // sa zone par celle de son batiment).
+        std::vector<ZoneMap*> newZones(count, (ZoneMap*)NULL);
+        std::vector<ZoneMap*> handleZones(count, (ZoneMap*)NULL);
+        std::vector<bool> ownedByBuilding(count, false);
+        bool anyChange = oldBuildingZone && buildingZone && oldBuildingZone != buildingZone;
+        for (size_t i = 0; i < count; ++i)
         {
             Building* f = g_drag.furniture[i];
-            RootObjectContainer* from = ContentOf(g_drag.furnitureZones[i]);
-            RootObjectContainer* to = ContentOf(ZoneOf(f));
-            if (!from || !to || from == to)
-                continue;
-            if (!Contains(from, f))
-            {
-                ++missing;
-                continue;
-            }
-            CallContainer(from, VTABLE_REMOVE_OBJECT, f);
-            if (!Contains(to, f))
-                CallContainer(to, VTABLE_ADD_ACTIVE_OBJECT, f);
-            f->instanceID.uid.clear();
-            f->notifyChange();
-            ++moved;
+            newZones[i] = ZoneOf(f);
+            handleZones[i] = HandleZone(f->handle);
+            // Seulement les meubles deja relies au batiment par "isInsideBuilding".
+            ownedByBuilding[i] = SameHandle(f->isInsideBuilding, b->handle)
+                || (f->isInsideBuilding.type == BUILDING && f->isInsideBuilding.getBuilding() == b);
+            if (newZones[i] && (newZones[i] != handleZones[i] || newZones[i] != g_drag.furnitureZones[i]))
+                anyChange = true;
         }
-        if (moved || missing || ZoneOf(g_drag.building) != g_drag.buildingZone)
+        if (!anyChange)
+            return;
+
+        // Batiment : identifiant dans la nouvelle zone, et selection de l'editeur.
+        const hand oldBuildingHandle = b->handle;
+        const bool buildingMoved = MoveHandleToZone(b, buildingZone);
+        if (buildingMoved && ou && ou->player && ou->player->levelEditor
+            && SameHandle(ou->player->levelEditor->selectedObject, oldBuildingHandle))
+            ou->player->levelEditor->selectedObject = b->handle;
+
+        size_t moved = 0, missing = 0, relinked = 0;
+        for (size_t i = 0; i < count; ++i)
         {
-            std::ostringstream s;
-            s << "BuildingMover : changement de zone, " << moved << " meuble(s) range(s) dans la nouvelle zone";
-            if (missing)
-                s << ", " << missing << " absent(s) de la liste de leur ancienne zone";
-            DebugLog(s.str());
+            Building* f = g_drag.furniture[i];
+            ZoneMap* zone = ownedByBuilding[i] ? buildingZone : newZones[i];
+            if (!zone)
+                continue;
+            bool changed = false;
+            if (handleZones[i] != zone || g_drag.furnitureZones[i] != zone)
+            {
+                if (!MoveToZoneList(f, zone, handleZones[i], g_drag.furnitureZones[i]))
+                    ++missing;
+                MoveHandleToZone(f, zone);
+                changed = true;
+            }
+            if (ownedByBuilding[i] && !SameHandle(f->isInsideBuilding, b->handle))
+            {
+                f->isInsideBuilding = b->handle;
+                ++relinked;
+                changed = true;
+            }
+            if (changed)
+            {
+                f->instanceID.uid.clear();
+                f->notifyChange();
+                ++moved;
+            }
         }
+
+        std::ostringstream s;
+        s << "BuildingMover : changement de zone, batiment " << (buildingMoved ? "re-identifie" : "inchange")
+          << ", " << moved << " meuble(s) range(s) dans la nouvelle zone, "
+          << relinked << " relie(s) au nouvel identifiant du batiment";
+        if (missing)
+            s << ", " << missing << " absent(s) des listes de zone";
+        DebugLog(s.str());
     }
 
     // Fin du glisser : replace les objets au sol avec le deplacement total.
@@ -523,7 +633,7 @@ namespace
 
 __declspec(dllexport) void startPlugin()
 {
-    DebugLog("BuildingMover : chargement (1.0.1, changement de zone)");
+    DebugLog("BuildingMover : chargement (1.0.1, changement de zone, identifiants)");
     g_drag.active = false;
     g_drag.building = NULL;
     g_drag.buildingZone = NULL;
